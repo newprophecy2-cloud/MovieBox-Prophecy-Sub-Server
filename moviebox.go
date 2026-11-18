@@ -20,7 +20,7 @@ import (
 
 const (
 	defaultMovieBoxHost = "https://api6.aoneroom.com"
-	defaultTimeout      = 20 * time.Second
+	defaultTimeout      = 25 * time.Second
 	maxResponseSize     = 8 << 20
 )
 
@@ -55,17 +55,32 @@ func (e *movieBoxHTTPError) Error() string {
 	return fmt.Sprintf("MovieBox HTTP %d: %s", e.StatusCode, e.Message)
 }
 
+// --------------------------------------------------
+// CLIENT
+// --------------------------------------------------
+
 func NewMovieBoxClient() *MovieBoxClient {
 	timeout := defaultTimeout
 
-	if v := os.Getenv("MOVIEBOX_REQUEST_TIMEOUT"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 120 {
-			timeout = time.Duration(n) * time.Second
+	// Keep the HTTP client timeout consistent with main.go.
+	if value := strings.TrimSpace(os.Getenv("REQUEST_TIMEOUT")); value != "" {
+		if seconds, err := strconv.Atoi(value); err == nil &&
+			seconds >= 1 && seconds <= 120 {
+			timeout = time.Duration(seconds) * time.Second
+		}
+	}
+
+	// Optional provider-specific override.
+	if value := strings.TrimSpace(os.Getenv("MOVIEBOX_REQUEST_TIMEOUT")); value != "" {
+		if seconds, err := strconv.Atoi(value); err == nil &&
+			seconds >= 1 && seconds <= 120 {
+			timeout = time.Duration(seconds) * time.Second
 		}
 	}
 
 	host := strings.TrimRight(
-		strings.TrimSpace(os.Getenv("MOVIEBOX_API_BASE_URL")), "/",
+		strings.TrimSpace(os.Getenv("MOVIEBOX_API_BASE_URL")),
+		"/",
 	)
 
 	if host == "" {
@@ -79,10 +94,12 @@ func NewMovieBoxClient() *MovieBoxClient {
 				if len(via) >= 5 {
 					return errors.New("too many redirects")
 				}
+
 				if len(via) > 0 &&
 					!strings.EqualFold(req.URL.Host, via[0].URL.Host) {
 					return errors.New("cross-host redirect rejected")
 				}
+
 				return nil
 			},
 		},
@@ -91,23 +108,24 @@ func NewMovieBoxClient() *MovieBoxClient {
 	}
 }
 
-// Search implements MovieBoxService.Search.
+// --------------------------------------------------
+// SEARCH
+// --------------------------------------------------
+
 func (m *MovieBoxClient) Search(
 	ctx context.Context,
 	query string,
 	page int,
 ) (any, error) {
 	query = strings.TrimSpace(query)
+
 	if query == "" {
 		return nil, errors.New("search query is required")
 	}
 	if len(query) > 200 {
 		return nil, errors.New("search query is too long")
 	}
-	if page < 1 {
-		page = 1
-	}
-	if page > 10000 {
+	if page < 1 || page > 10000 {
 		return nil, errors.New("invalid page")
 	}
 
@@ -119,6 +137,7 @@ func (m *MovieBoxClient) Search(
 	}
 
 	var result movieBoxResponse
+
 	if err := m.postJSON(
 		ctx,
 		"/wefeed-mobile-bff/subject-api/search/v2",
@@ -131,7 +150,10 @@ func (m *MovieBoxClient) Search(
 	return unwrapData(result), nil
 }
 
-// Details implements MovieBoxService.Details.
+// --------------------------------------------------
+// DETAILS
+// --------------------------------------------------
+
 func (m *MovieBoxClient) Details(
 	ctx context.Context,
 	subjectID string,
@@ -140,10 +162,13 @@ func (m *MovieBoxClient) Details(
 		return nil, err
 	}
 
-	path := "/wefeed-mobile-bff/subject-api/get?subjectId=" +
-		url.QueryEscape(subjectID)
+	query := url.Values{}
+	query.Set("subjectId", subjectID)
+
+	path := "/wefeed-mobile-bff/subject-api/get?" + query.Encode()
 
 	var result movieBoxResponse
+
 	if err := m.getJSON(ctx, path, &result); err != nil {
 		return nil, err
 	}
@@ -153,14 +178,18 @@ func (m *MovieBoxClient) Details(
 		return nil, errors.New("MovieBox returned no subject details")
 	}
 
-	// Official MovieBox uses subjectType=2 for series.
+	// Series subject type.
 	if readInt(subject, "subjectType", "stype") == 2 {
-		seasonPath := "/wefeed-mobile-bff/subject-api/season-info?subjectId=" +
-			url.QueryEscape(subjectID)
+		seasonQuery := url.Values{}
+		seasonQuery.Set("subjectId", subjectID)
+
+		seasonPath := "/wefeed-mobile-bff/subject-api/season-info?" +
+			seasonQuery.Encode()
 
 		var seasonResponse movieBoxResponse
+
 		if err := m.getJSON(ctx, seasonPath, &seasonResponse); err != nil {
-			// Details remain usable even if season metadata is unavailable.
+			// Preserve details even if season metadata is unavailable.
 			subject["season_info_error"] = err.Error()
 		} else {
 			subject["seasons"] = unwrapData(seasonResponse)
@@ -170,8 +199,10 @@ func (m *MovieBoxClient) Details(
 	return result, nil
 }
 
-// Episodes implements MovieBoxService.Episodes.
-// It exposes episode metadata; it does not claim that an episode has a playable stream.
+// --------------------------------------------------
+// EPISODES
+// --------------------------------------------------
+
 func (m *MovieBoxClient) Episodes(
 	ctx context.Context,
 	subjectID string,
@@ -201,16 +232,18 @@ func (m *MovieBoxClient) Episodes(
 
 	seasons := extractSeasons(subject)
 	if len(seasons) == 0 {
-		// Some responses put the season payload at the root.
 		seasons = extractSeasons(payload)
 	}
+
 	if len(seasons) == 0 {
 		return nil, errors.New("MovieBox season information unavailable")
 	}
 
 	var selected map[string]any
+
 	for _, item := range seasons {
-		if readInt(item, "se", "season", "seasonNumber") == season {
+		number := readInt(item, "se", "season", "seasonNumber")
+		if number == season {
 			selected = item
 			break
 		}
@@ -220,6 +253,7 @@ func (m *MovieBoxClient) Episodes(
 	if selected == nil && season == 0 {
 		selected = seasons[0]
 	}
+
 	if selected == nil {
 		return nil, fmt.Errorf("season %d not found", season)
 	}
@@ -241,16 +275,19 @@ func (m *MovieBoxClient) Episodes(
 	}
 
 	return map[string]any{
-		"provider":   "moviebox",
-		"subject_id": subjectID,
-		"season":     seasonNumber,
-		"episodes":   episodes,
+		"provider":    "moviebox",
+		"subject_id":  subjectID,
+		"season":      seasonNumber,
+		"episode_count": len(episodes),
+		"episodes":    episodes,
 		"season_data": selected,
 	}, nil
 }
 
-// Sources implements MovieBoxService.Sources.
-// URLs returned here are metadata candidates, not verified playable streams.
+// --------------------------------------------------
+// SOURCES
+// --------------------------------------------------
+
 func (m *MovieBoxClient) Sources(
 	ctx context.Context,
 	subjectID string,
@@ -260,6 +297,7 @@ func (m *MovieBoxClient) Sources(
 	if err := validateID(subjectID); err != nil {
 		return nil, err
 	}
+
 	if season < 0 || season > 1000 ||
 		episode < 1 || episode > 100000 {
 		return nil, errors.New("invalid season or episode")
@@ -270,7 +308,8 @@ func (m *MovieBoxClient) Sources(
 	query.Set("se", strconv.Itoa(season))
 	query.Set("ep", strconv.Itoa(episode))
 
-	playPath := "/wefeed-mobile-bff/subject-api/play-info/v2?" + query.Encode()
+	playPath := "/wefeed-mobile-bff/subject-api/play-info/v2?" +
+		query.Encode()
 
 	resourceQuery := url.Values{}
 	resourceQuery.Set("subjectId", subjectID)
@@ -282,62 +321,64 @@ func (m *MovieBoxClient) Sources(
 	resourcePath := "/wefeed-mobile-bff/subject-api/resource?" +
 		resourceQuery.Encode()
 
-	type result struct {
+	type requestResult struct {
 		data movieBoxResponse
 		err  error
 	}
 
-	playCh := make(chan result, 1)
-	resourceCh := make(chan result, 1)
+	playCh := make(chan requestResult, 1)
+	resourceCh := make(chan requestResult, 1)
 
 	go func() {
 		var data movieBoxResponse
 		err := m.getJSON(ctx, playPath, &data)
-		playCh <- result{data: data, err: err}
+		playCh <- requestResult{data: data, err: err}
 	}()
 
 	go func() {
 		var data movieBoxResponse
 		err := m.getJSON(ctx, resourcePath, &data)
-		resourceCh <- result{data: data, err: err}
+		resourceCh <- requestResult{data: data, err: err}
 	}()
 
-	var play, resource result
+	var playResult, resourceResult requestResult
 
 	select {
-	case play = <-playCh:
+	case playResult = <-playCh:
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
 
 	select {
-	case resource = <-resourceCh:
+	case resourceResult = <-resourceCh:
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
 
-	if play.err != nil && resource.err != nil {
+	if playResult.err != nil && resourceResult.err != nil {
 		return nil, fmt.Errorf(
 			"MovieBox source metadata unavailable: play-info: %v; resource: %v",
-			play.err,
-			resource.err,
+			playResult.err,
+			resourceResult.err,
 		)
 	}
 
 	sources := make([]map[string]any, 0)
 	seen := make(map[string]bool)
 
-	if play.err == nil {
-		for _, item := range collectMaps(play.data) {
-			if source := normalizeSource(item, season, episode); source != nil {
+	if playResult.err == nil {
+		for _, item := range collectMaps(playResult.data) {
+			source := normalizeSource(item, season, episode)
+			if source != nil {
 				addSource(&sources, seen, source)
 			}
 		}
 	}
 
-	if resource.err == nil {
-		for _, item := range extractResourceItems(resource.data) {
-			if source := normalizeSource(item, season, episode); source != nil {
+	if resourceResult.err == nil {
+		for _, item := range extractResourceItems(resourceResult.data) {
+			source := normalizeSource(item, season, episode)
+			if source != nil {
 				addSource(&sources, seen, source)
 			}
 		}
@@ -355,7 +396,10 @@ func (m *MovieBoxClient) Sources(
 	}, nil
 }
 
-// Subtitles implements MovieBoxService.Subtitles.
+// --------------------------------------------------
+// SUBTITLES
+// --------------------------------------------------
+
 func (m *MovieBoxClient) Subtitles(
 	ctx context.Context,
 	subjectID string,
@@ -376,6 +420,7 @@ func (m *MovieBoxClient) Subtitles(
 		query.Encode()
 
 	var result movieBoxResponse
+
 	if err := m.getJSON(ctx, path, &result); err != nil {
 		return nil, err
 	}
@@ -388,7 +433,9 @@ func (m *MovieBoxClient) Subtitles(
 	}, nil
 }
 
-// HTTP transport.
+// --------------------------------------------------
+// HTTP REQUESTS
+// --------------------------------------------------
 
 func (m *MovieBoxClient) getJSON(
 	ctx context.Context,
@@ -417,10 +464,13 @@ func (m *MovieBoxClient) requestJSON(
 	if ctx == nil {
 		return errors.New("request context is required")
 	}
+
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if !strings.HasPrefix(path, "/") || strings.HasPrefix(path, "//") {
+
+	if !strings.HasPrefix(path, "/") ||
+		strings.HasPrefix(path, "//") {
 		return errors.New("invalid API path")
 	}
 
@@ -455,7 +505,7 @@ func (m *MovieBoxClient) requestJSON(
 			requestBody,
 		)
 		if err != nil {
-			return err
+			return fmt.Errorf("create upstream request: %w", err)
 		}
 
 		req.Header.Set("Accept", "application/json")
@@ -465,6 +515,7 @@ func (m *MovieBoxClient) requestJSON(
 		token := m.token
 		m.mu.RUnlock()
 
+		// Only use a token explicitly supplied by the operator.
 		if token != "" {
 			req.Header.Set("Authorization", "Bearer "+token)
 		}
@@ -495,20 +546,18 @@ func (m *MovieBoxClient) requestJSON(
 		}
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			message := extractErrorMessage(data)
 			httpErr := &movieBoxHTTPError{
 				StatusCode: resp.StatusCode,
-				Message:    message,
+				Message:    extractErrorMessage(data),
 			}
 
-			// A 401/403 is an authorization response.
-			// Do not disguise it as a successful host failover.
+			// Do not disguise authorization failures as host failures.
 			if resp.StatusCode == http.StatusUnauthorized ||
 				resp.StatusCode == http.StatusForbidden {
 				return httpErr
 			}
 
-			// Retry transient upstream failures on another configured host.
+			// Retry temporary upstream failures on configured hosts.
 			if resp.StatusCode == http.StatusTooManyRequests ||
 				resp.StatusCode >= 500 {
 				lastErr = httpErr
@@ -516,6 +565,10 @@ func (m *MovieBoxClient) requestJSON(
 			}
 
 			return httpErr
+		}
+
+		if out == nil {
+			return nil
 		}
 
 		if err := json.Unmarshal(data, out); err != nil {
@@ -534,25 +587,32 @@ func (m *MovieBoxClient) requestJSON(
 
 func (m *MovieBoxClient) hosts() ([]string, error) {
 	raw := strings.TrimSpace(m.baseURL)
+
 	if raw == "" {
 		raw = defaultMovieBoxHost
 	}
 
 	u, err := url.Parse(raw)
-	if err != nil || u.Host == "" ||
+
+	if err != nil ||
+		u.Host == "" ||
 		(u.Scheme != "https" && u.Scheme != "http") ||
-		u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		u.User != nil ||
+		u.RawQuery != "" ||
+		u.Fragment != "" {
 		return nil, errors.New("invalid MOVIEBOX_API_BASE_URL")
 	}
 
-	if raw == defaultMovieBoxHost {
+	if strings.TrimRight(raw, "/") == defaultMovieBoxHost {
 		return movieBoxHosts, nil
 	}
 
 	return []string{strings.TrimRight(raw, "/")}, nil
 }
 
-// Response adapters.
+// --------------------------------------------------
+// RESPONSE PARSERS
+// --------------------------------------------------
 
 func unwrapData(data map[string]any) map[string]any {
 	if data == nil {
@@ -600,12 +660,13 @@ func extractSeasons(data map[string]any) []map[string]any {
 		return items
 	}
 
-	// Some season-info responses return data.seasons.
 	if nested, ok := data["data"].(map[string]any); ok {
 		value = nested["seasons"]
+
 		if inner, ok := value.(map[string]any); ok {
 			value = inner["seasons"]
 		}
+
 		return toMaps(value)
 	}
 
@@ -624,20 +685,35 @@ func extractEpisodeNumbers(season map[string]any) []int {
 
 	result := make([]int, 0)
 
-	switch v := value.(type) {
+	switch items := value.(type) {
 	case []any:
-		for _, item := range v {
-			switch n := item.(type) {
+		for _, item := range items {
+			switch current := item.(type) {
 			case float64:
-				if n > 0 {
-					result = append(result, int(n))
+				if current > 0 {
+					result = append(result, int(current))
 				}
+
+			case int:
+				if current > 0 {
+					result = append(result, current)
+				}
+
 			case string:
-				if parsed, err := strconv.Atoi(strings.TrimSpace(n)); err == nil && parsed > 0 {
-					result = append(result, parsed)
+				if number, err := strconv.Atoi(strings.TrimSpace(current)); err == nil &&
+					number > 0 {
+					result = append(result, number)
 				}
+
 			case map[string]any:
-				number := readInt(n, "ep", "episode", "number", "episodeNumber")
+				number := readInt(
+					current,
+					"ep",
+					"episode",
+					"number",
+					"episodeNumber",
+				)
+
 				if number > 0 {
 					result = append(result, number)
 				}
@@ -646,7 +722,13 @@ func extractEpisodeNumbers(season map[string]any) []int {
 	}
 
 	if len(result) == 0 {
-		max := readInt(season, "maxEp", "episodeCount", "totalEpisodes")
+		max := readInt(
+			season,
+			"maxEp",
+			"episodeCount",
+			"totalEpisodes",
+		)
+
 		if max > 0 && max <= 10000 {
 			for i := 1; i <= max; i++ {
 				result = append(result, i)
@@ -666,13 +748,19 @@ func extractResourceItems(data map[string]any) []map[string]any {
 		data = nested
 	}
 
-	return toMaps(data["list"])
+	items := toMaps(data["list"])
+	if len(items) > 0 {
+		return items
+	}
+
+	return toMaps(data["resources"])
 }
 
 func collectMaps(data map[string]any) []map[string]any {
 	result := make([]map[string]any, 0)
 
 	var walk func(any, int)
+
 	walk = func(value any, depth int) {
 		if depth > 6 {
 			return
@@ -684,8 +772,13 @@ func collectMaps(data map[string]any) []map[string]any {
 
 			for key, child := range current {
 				switch key {
-				case "streams", "list", "data", "resources",
-					"resourceList", "playList", "sources":
+				case "streams",
+					"list",
+					"data",
+					"resources",
+					"resourceList",
+					"playList",
+					"sources":
 					walk(child, depth+1)
 				}
 			}
@@ -716,6 +809,7 @@ func normalizeSource(
 	if itemSeason != 0 && itemSeason != season {
 		return nil
 	}
+
 	if itemEpisode != 0 && itemEpisode != episode {
 		return nil
 	}
@@ -743,30 +837,42 @@ func normalizeSource(
 		"filename": readString(item, "fileName", "filename", "title"),
 		"headers":  map[string]string{},
 		"type":     "unverified",
+		"verified": false,
 	}
 }
 
 func validMediaURL(raw string) bool {
 	raw = strings.TrimSpace(raw)
+
 	if raw == "" || len(raw) > 8192 {
 		return false
 	}
 
 	u, err := url.Parse(raw)
-	if err != nil || u.Scheme != "https" || u.Hostname() == "" {
+
+	if err != nil ||
+		u.Scheme != "https" ||
+		u.Hostname() == "" ||
+		u.User != nil {
 		return false
 	}
 
 	host := strings.ToLower(u.Hostname())
 
-	if host == "localhost" || host == "127.0.0.1" ||
-		host == "::1" || strings.HasSuffix(host, ".local") {
+	if host == "localhost" ||
+		host == "127.0.0.1" ||
+		host == "::1" ||
+		strings.HasSuffix(host, ".local") {
 		return false
 	}
 
 	lower := strings.ToLower(raw)
+
 	for _, word := range []string{
-		"notice", "deprecation", "placeholder", "error.mp4",
+		"notice",
+		"deprecation",
+		"placeholder",
+		"error.mp4",
 	} {
 		if strings.Contains(lower, word) {
 			return false
@@ -782,6 +888,7 @@ func addSource(
 	source map[string]any,
 ) {
 	raw, _ := source["url"].(string)
+
 	if raw == "" {
 		return
 	}
@@ -791,7 +898,8 @@ func addSource(
 		return
 	}
 
-	key := u.Host + u.Path
+	key := strings.ToLower(u.Host) + u.EscapedPath()
+
 	if seen[key] {
 		return
 	}
@@ -810,6 +918,7 @@ func extractCaptions(data map[string]any) []map[string]any {
 	}
 
 	items := toMaps(data["extCaptions"])
+
 	if len(items) == 0 {
 		items = toMaps(data["captions"])
 	}
@@ -818,6 +927,7 @@ func extractCaptions(data map[string]any) []map[string]any {
 
 	for _, item := range items {
 		rawURL := readString(item, "url", "captionUrl")
+
 		if !validMediaURL(rawURL) {
 			continue
 		}
@@ -832,7 +942,9 @@ func extractCaptions(data map[string]any) []map[string]any {
 	return result
 }
 
-// Generic helpers.
+// --------------------------------------------------
+// GENERIC HELPERS
+// --------------------------------------------------
 
 func toMaps(value any) []map[string]any {
 	array, ok := value.([]any)
@@ -841,43 +953,68 @@ func toMaps(value any) []map[string]any {
 	}
 
 	result := make([]map[string]any, 0, len(array))
+
 	for _, item := range array {
 		if object, ok := item.(map[string]any); ok {
 			result = append(result, object)
 		}
 	}
+
 	return result
 }
 
-func readString(data map[string]any, keys ...string) string {
+func readString(
+	data map[string]any,
+	keys ...string,
+) string {
+	if data == nil {
+		return ""
+	}
+
 	for _, key := range keys {
 		if value, ok := data[key].(string); ok {
 			value = strings.TrimSpace(value)
+
 			if value != "" {
 				return value
 			}
 		}
 	}
+
 	return ""
 }
 
-func readInt(data map[string]any, keys ...string) int {
+func readInt(
+	data map[string]any,
+	keys ...string,
+) int {
+	if data == nil {
+		return 0
+	}
+
 	for _, key := range keys {
 		switch value := data[key].(type) {
 		case float64:
 			return int(value)
+
 		case int:
 			return value
+
+		case int64:
+			return int(value)
+
 		case json.Number:
-			n, _ := value.Int64()
-			return int(n)
+			number, _ := value.Int64()
+			return int(number)
+
 		case string:
-			n, _ := strconv.Atoi(strings.TrimSpace(value))
-			if n != 0 {
-				return n
+			number, err := strconv.Atoi(strings.TrimSpace(value))
+			if err == nil {
+				return number
 			}
 		}
 	}
+
 	return 0
 }
 
@@ -887,6 +1024,7 @@ func validateID(value string) error {
 	if value == "" || len(value) > 512 {
 		return errors.New("invalid identifier")
 	}
+
 	if strings.ContainsAny(value, "\r\n") {
 		return errors.New("invalid identifier")
 	}
@@ -896,16 +1034,24 @@ func validateID(value string) error {
 
 func extractErrorMessage(data []byte) string {
 	var payload map[string]any
+
 	if err := json.Unmarshal(data, &payload); err != nil {
 		return ""
 	}
 
-	for _, key := range []string{"message", "msg", "error", "detail"} {
+	for _, key := range []string{
+		"message",
+		"msg",
+		"error",
+		"detail",
+	} {
 		if value, ok := payload[key].(string); ok {
 			value = strings.TrimSpace(value)
+
 			if len(value) > 300 {
 				value = value[:300]
 			}
+
 			return value
 		}
 	}
@@ -913,4 +1059,5 @@ func extractErrorMessage(data []byte) string {
 	return ""
 }
 
+// Compile-time interface verification.
 var _ MovieBoxService = (*MovieBoxClient)(nil)
