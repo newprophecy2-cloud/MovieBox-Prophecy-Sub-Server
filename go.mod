@@ -1,3 +1,4 @@
+
 module moviebox-prophecy-sub-server
 
 go 1.23
