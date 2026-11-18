@@ -4,8 +4,9 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
-	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -13,11 +14,6 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/recover"
-)
-
-const (
-	ServiceName    = "MovieBox Prophecy Sub Server"
-	ServiceVersion = "1.0.0"
 )
 
 type MovieBoxService interface {
@@ -30,261 +26,299 @@ type MovieBoxService interface {
 
 type API struct {
 	moviebox MovieBoxService
+	timeout  time.Duration
+}
+
+type APIResponse struct {
+	Status   string `json:"status"`
+	Provider string `json:"provider"`
+	Action   string `json:"action,omitempty"`
+	Data     any    `json:"data,omitempty"`
+	Error    string `json:"error,omitempty"`
 }
 
 func main() {
-	moviebox := NewMovieBoxClient()
+	port := strings.TrimSpace(os.Getenv("PORT"))
+	if port == "" {
+		port = "10000"
+	}
+
+	timeout := 25 * time.Second
+
+	if value := os.Getenv("REQUEST_TIMEOUT"); value != "" {
+		if seconds, err := strconv.Atoi(value); err == nil &&
+			seconds >= 1 && seconds <= 120 {
+			timeout = time.Duration(seconds) * time.Second
+		}
+	}
+
+	client := NewMovieBoxClient()
 
 	api := &API{
-		moviebox: moviebox,
+		moviebox: client,
+		timeout:  timeout,
 	}
 
 	app := fiber.New(fiber.Config{
-		AppName:      ServiceName,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
-		BodyLimit:    1 * 1024 * 1024,
-		ErrorHandler: func(c *fiber.Ctx, err error) error {
-			code := fiber.StatusInternalServerError
-
-			var fiberErr *fiber.Error
-			if errors.As(err, &fiberErr) {
-				code = fiberErr.Code
-			}
-
-			return c.Status(code).JSON(fiber.Map{
-				"status":  "error",
-				"message": http.StatusText(code),
-			})
-		},
+		AppName:               "MovieBox Prophecy Sub Server",
+		ReadTimeout:           30 * time.Second,
+		WriteTimeout:          30 * time.Second,
+		IdleTimeout:           60 * time.Second,
+		BodyLimit:             1 * 1024 * 1024,
+		DisableStartupMessage: true,
 	})
 
 	app.Use(recover.New())
+
 	app.Use(cors.New(cors.Config{
 		AllowOrigins: "*",
 		AllowMethods: "GET,HEAD,OPTIONS",
-		AllowHeaders: "Origin, Content-Type, Accept",
+		AllowHeaders: "Origin,Content-Type,Accept,Authorization",
 	}))
 
-	app.Get("/", api.root)
-	app.Get("/health", api.health)
+	// Root.
+	app.Get("/", func(c *fiber.Ctx) error {
+		return c.JSON(fiber.Map{
+			"name":    "MovieBox Prophecy Sub Server",
+			"version": "1.0.0",
+			"status":  "online",
+			"health":  "/health",
+			"provider": "moviebox",
+			"routes": fiber.Map{
+				"search":    "/api/v1/anime/search?q=Naruto",
+				"details":   "/api/v1/anime/:id",
+				"episodes":  "/api/v1/anime/:id/episodes?season=1",
+				"sources":   "/api/v1/anime/:id/sources?season=1&episode=1",
+				"subtitles": "/api/v1/anime/:id/subtitles?resource_id=RESOURCE_ID",
+			},
+		})
+	})
+
+	// Health.
+	app.Get("/health", func(c *fiber.Ctx) error {
+		return c.JSON(fiber.Map{
+			"status":   "ok",
+			"provider": "moviebox",
+			"service":  "prophecy-moviebox",
+		})
+	})
 
 	v1 := app.Group("/api/v1")
-
 	anime := v1.Group("/anime")
+
+	// Search.
 	anime.Get("/search", api.search)
+
+	// Details.
 	anime.Get("/:id", api.details)
+
+	// Episodes.
 	anime.Get("/:id/episodes", api.episodes)
+
+	// Playback metadata and resources.
 	anime.Get("/:id/sources", api.sources)
+
+	// Subtitles.
 	anime.Get("/:id/subtitles", api.subtitles)
 
-	port := strings.TrimSpace(getEnv("PORT", "10000"))
+	// Unknown route.
+	app.Use(func(c *fiber.Ctx) error {
+		return c.Status(fiber.StatusNotFound).JSON(APIResponse{
+			Status:   "error",
+			Provider: "moviebox",
+			Error:    "Route not found",
+		})
+	})
 
-	log.Printf("%s starting on port %s", ServiceName, port)
+	log.Printf("MovieBox Prophecy server listening on :%s", port)
 
 	if err := app.Listen(":" + port); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func (a *API) root(c *fiber.Ctx) error {
-	return c.JSON(fiber.Map{
-		"name":    ServiceName,
-		"version": ServiceVersion,
-		"status":  "online",
-		"health":  "/health",
-		"routes": fiber.Map{
-			"search":    "/api/v1/anime/search?q=Naruto",
-			"details":   "/api/v1/anime/{id}",
-			"episodes":  "/api/v1/anime/{id}/episodes?season=1",
-			"sources":   "/api/v1/anime/{id}/sources?season=1&episode=1",
-			"subtitles": "/api/v1/anime/{id}/subtitles?resource_id={resource_id}",
-		},
-	})
-}
-
-func (a *API) health(c *fiber.Ctx) error {
-	return c.JSON(fiber.Map{
-		"status":   "ok",
-		"provider": "moviebox",
-		"service":  "prophecy-moviebox",
-	})
-}
-
 func (a *API) search(c *fiber.Ctx) error {
 	query := strings.TrimSpace(c.Query("q"))
+
 	if query == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"status":  "error",
-			"message": "Query parameter q is required",
-		})
+		return apiError(c, fiber.StatusBadRequest, "Query parameter q is required")
 	}
 
-	page, err := queryInt(c, "page", 1)
-	if err != nil || page < 1 {
-		return badRequest(c, "page must be a positive integer")
+	page := c.QueryInt("page", 1)
+
+	if page < 1 || page > 10000 {
+		return apiError(c, fiber.StatusBadRequest, "Invalid page")
 	}
 
-	ctx, cancel := requestContext(c)
+	ctx, cancel := a.requestContext(c)
 	defer cancel()
 
-	data, err := a.moviebox.Search(ctx, query, page)
+	result, err := a.moviebox.Search(ctx, query, page)
 	if err != nil {
-		return providerError(c, err)
+		return handleProviderError(c, err)
 	}
 
-	return c.JSON(fiber.Map{
-		"status":   "success",
-		"provider": "moviebox",
-		"action":   "search",
-		"data":     data,
+	return c.JSON(APIResponse{
+		Status:   "success",
+		Provider: "moviebox",
+		Action:   "search",
+		Data:     result,
 	})
 }
 
 func (a *API) details(c *fiber.Ctx) error {
-	subjectID := strings.TrimSpace(c.Params("id"))
-	if subjectID == "" {
-		return badRequest(c, "Anime ID is required")
+	id := strings.TrimSpace(c.Params("id"))
+
+	if id == "" {
+		return apiError(c, fiber.StatusBadRequest, "Anime ID is required")
 	}
 
-	ctx, cancel := requestContext(c)
+	ctx, cancel := a.requestContext(c)
 	defer cancel()
 
-	data, err := a.moviebox.Details(ctx, subjectID)
+	result, err := a.moviebox.Details(ctx, id)
 	if err != nil {
-		return providerError(c, err)
+		return handleProviderError(c, err)
 	}
 
-	return c.JSON(fiber.Map{
-		"status":   "success",
-		"provider": "moviebox",
-		"action":   "details",
-		"data":     data,
+	return c.JSON(APIResponse{
+		Status:   "success",
+		Provider: "moviebox",
+		Action:   "details",
+		Data:     result,
 	})
 }
 
 func (a *API) episodes(c *fiber.Ctx) error {
-	subjectID := strings.TrimSpace(c.Params("id"))
-	if subjectID == "" {
-		return badRequest(c, "Anime ID is required")
+	id := strings.TrimSpace(c.Params("id"))
+	season := c.QueryInt("season", 1)
+
+	if id == "" {
+		return apiError(c, fiber.StatusBadRequest, "Anime ID is required")
 	}
 
-	season, err := queryInt(c, "season", 1)
-	if err != nil || season < 0 {
-		return badRequest(c, "season must be zero or a positive integer")
+	if season < 0 || season > 1000 {
+		return apiError(c, fiber.StatusBadRequest, "Invalid season")
 	}
 
-	ctx, cancel := requestContext(c)
+	ctx, cancel := a.requestContext(c)
 	defer cancel()
 
-	data, err := a.moviebox.Episodes(ctx, subjectID, season)
+	result, err := a.moviebox.Episodes(ctx, id, season)
 	if err != nil {
-		return providerError(c, err)
+		return handleProviderError(c, err)
 	}
 
-	return c.JSON(fiber.Map{
-		"status":   "success",
-		"provider": "moviebox",
-		"action":   "episodes",
-		"data":     data,
+	return c.JSON(APIResponse{
+		Status:   "success",
+		Provider: "moviebox",
+		Action:   "episodes",
+		Data:     result,
 	})
 }
 
 func (a *API) sources(c *fiber.Ctx) error {
-	subjectID := strings.TrimSpace(c.Params("id"))
-	if subjectID == "" {
-		return badRequest(c, "Anime ID is required")
+	id := strings.TrimSpace(c.Params("id"))
+	season := c.QueryInt("season", 1)
+	episode := c.QueryInt("episode", 1)
+
+	if id == "" {
+		return apiError(c, fiber.StatusBadRequest, "Anime ID is required")
 	}
 
-	season, err := queryInt(c, "season", 0)
-	if err != nil || season < 0 {
-		return badRequest(c, "Invalid season")
+	if season < 0 || season > 1000 {
+		return apiError(c, fiber.StatusBadRequest, "Invalid season")
 	}
 
-	episode, err := queryInt(c, "episode", 0)
-	if err != nil || episode < 0 {
-		return badRequest(c, "Invalid episode")
+	if episode < 1 || episode > 100000 {
+		return apiError(c, fiber.StatusBadRequest, "Invalid episode")
 	}
 
-	if (season == 0) != (episode == 0) {
-		return badRequest(c, "Season and episode must both be zero or both be positive")
-	}
-
-	ctx, cancel := requestContext(c)
+	ctx, cancel := a.requestContext(c)
 	defer cancel()
 
-	data, err := a.moviebox.Sources(ctx, subjectID, season, episode)
+	result, err := a.moviebox.Sources(ctx, id, season, episode)
 	if err != nil {
-		return providerError(c, err)
+		return handleProviderError(c, err)
 	}
 
-	return c.JSON(fiber.Map{
-		"status":   "success",
-		"provider": "moviebox",
-		"action":   "sources",
-		"data":     data,
+	return c.JSON(APIResponse{
+		Status:   "success",
+		Provider: "moviebox",
+		Action:   "sources",
+		Data:     result,
 	})
 }
 
 func (a *API) subtitles(c *fiber.Ctx) error {
-	subjectID := strings.TrimSpace(c.Params("id"))
+	id := strings.TrimSpace(c.Params("id"))
 	resourceID := strings.TrimSpace(c.Query("resource_id"))
 
-	if subjectID == "" || resourceID == "" {
-		return badRequest(c, "Anime ID and resource_id are required")
+	if id == "" || resourceID == "" {
+		return apiError(
+			c,
+			fiber.StatusBadRequest,
+			"Anime ID and resource_id are required",
+		)
 	}
 
-	ctx, cancel := requestContext(c)
+	ctx, cancel := a.requestContext(c)
 	defer cancel()
 
-	data, err := a.moviebox.Subtitles(ctx, subjectID, resourceID)
+	result, err := a.moviebox.Subtitles(ctx, id, resourceID)
 	if err != nil {
-		return providerError(c, err)
+		return handleProviderError(c, err)
 	}
 
-	return c.JSON(fiber.Map{
-		"status":   "success",
-		"provider": "moviebox",
-		"action":   "subtitles",
-		"data":     data,
+	return c.JSON(APIResponse{
+		Status:   "success",
+		Provider: "moviebox",
+		Action:   "subtitles",
+		Data:     result,
 	})
 }
 
-func queryInt(c *fiber.Ctx, key string, fallback int) (int, error) {
-	value := strings.TrimSpace(c.Query(key))
-	if value == "" {
-		return fallback, nil
-	}
-
-	return strconv.Atoi(value)
+func (a *API) requestContext(c *fiber.Ctx) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), a.timeout)
 }
 
-func requestContext(c *fiber.Ctx) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), 25*time.Second)
-}
-
-func badRequest(c *fiber.Ctx, message string) error {
-	return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-		"status":  "error",
-		"message": message,
+func apiError(c *fiber.Ctx, status int, message string) error {
+	return c.Status(status).JSON(APIResponse{
+		Status:   "error",
+		Provider: "moviebox",
+		Error:    message,
 	})
 }
 
-func providerError(c *fiber.Ctx, err error) error {
+func handleProviderError(c *fiber.Ctx, err error) error {
+	if err == nil {
+		return apiError(c, fiber.StatusInternalServerError, "Unknown provider error")
+	}
+
+	if errors.Is(err, context.DeadlineExceeded) {
+		return apiError(c, fiber.StatusGatewayTimeout, "MovieBox request timed out")
+	}
+
+	if errors.Is(err, context.Canceled) {
+		return apiError(c, fiber.StatusRequestTimeout, "Request cancelled")
+	}
+
+	message := err.Error()
+
+	status := fiber.StatusBadGateway
+
+	if strings.Contains(message, "required") ||
+		strings.Contains(message, "invalid") {
+		status = fiber.StatusBadRequest
+	}
+
 	log.Printf("MovieBox provider error: %v", err)
 
-	return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{
-		"status":   "error",
-		"provider": "moviebox",
-		"message":  "MovieBox provider request failed",
+	return c.Status(status).JSON(APIResponse{
+		Status:   "error",
+		Provider: "moviebox",
+		Error:    message,
 	})
 }
 
-func getEnv(key, fallback string) string {
-	value := strings.TrimSpace(strings.TrimSpace(getenv(key)))
-	if value == "" {
-		return fallback
-	}
-	return value
-}
+var _ = fmt.Sprintf
