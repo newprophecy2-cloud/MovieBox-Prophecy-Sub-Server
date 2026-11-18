@@ -4,7 +4,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log"
 	"os"
 	"strconv"
@@ -44,12 +43,12 @@ func main() {
 	}
 
 	timeout := 25 * time.Second
-
-	if value := os.Getenv("REQUEST_TIMEOUT"); value != "" {
-		if seconds, err := strconv.Atoi(value); err == nil &&
-			seconds >= 1 && seconds <= 120 {
-			timeout = time.Duration(seconds) * time.Second
+	if value := strings.TrimSpace(os.Getenv("REQUEST_TIMEOUT")); value != "" {
+		seconds, err := strconv.Atoi(value)
+		if err != nil || seconds < 1 || seconds > 120 {
+			log.Fatal("REQUEST_TIMEOUT must be between 1 and 120 seconds")
 		}
+		timeout = time.Duration(seconds) * time.Second
 	}
 
 	client := NewMovieBoxClient()
@@ -76,16 +75,16 @@ func main() {
 		AllowHeaders: "Origin,Content-Type,Accept,Authorization",
 	}))
 
-	// Root.
+	// Root route.
 	app.Get("/", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{
-			"name":    "MovieBox Prophecy Sub Server",
-			"version": "1.0.0",
-			"status":  "online",
-			"health":  "/health",
+			"name":     "MovieBox Prophecy Sub Server",
+			"version":  "1.0.0",
 			"provider": "moviebox",
+			"status":   "online",
+			"health":   "/health",
 			"routes": fiber.Map{
-				"search":    "/api/v1/anime/search?q=Naruto",
+				"search":    "/api/v1/anime/search?q=Naruto&page=1",
 				"details":   "/api/v1/anime/:id",
 				"episodes":  "/api/v1/anime/:id/episodes?season=1",
 				"sources":   "/api/v1/anime/:id/sources?season=1&episode=1",
@@ -94,7 +93,7 @@ func main() {
 		})
 	})
 
-	// Health.
+	// Health route checks the local server, not upstream MovieBox availability.
 	app.Get("/health", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{
 			"status":   "ok",
@@ -106,22 +105,13 @@ func main() {
 	v1 := app.Group("/api/v1")
 	anime := v1.Group("/anime")
 
-	// Search.
 	anime.Get("/search", api.search)
-
-	// Details.
 	anime.Get("/:id", api.details)
-
-	// Episodes.
 	anime.Get("/:id/episodes", api.episodes)
-
-	// Playback metadata and resources.
 	anime.Get("/:id/sources", api.sources)
-
-	// Subtitles.
 	anime.Get("/:id/subtitles", api.subtitles)
 
-	// Unknown route.
+	// Unknown route handler.
 	app.Use(func(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusNotFound).JSON(APIResponse{
 			Status:   "error",
@@ -130,22 +120,24 @@ func main() {
 		})
 	})
 
-	log.Printf("MovieBox Prophecy server listening on :%s", port)
+	log.Printf("MovieBox Prophecy server listening on port %s", port)
 
 	if err := app.Listen(":" + port); err != nil {
-		log.Fatal(err)
+		log.Fatalf("Server failed: %v", err)
 	}
 }
 
+// Search: GET /api/v1/anime/search?q=Naruto&page=1
 func (a *API) search(c *fiber.Ctx) error {
 	query := strings.TrimSpace(c.Query("q"))
-
 	if query == "" {
 		return apiError(c, fiber.StatusBadRequest, "Query parameter q is required")
 	}
+	if len(query) > 200 {
+		return apiError(c, fiber.StatusBadRequest, "Search query is too long")
+	}
 
 	page := c.QueryInt("page", 1)
-
 	if page < 1 || page > 10000 {
 		return apiError(c, fiber.StatusBadRequest, "Invalid page")
 	}
@@ -158,19 +150,14 @@ func (a *API) search(c *fiber.Ctx) error {
 		return handleProviderError(c, err)
 	}
 
-	return c.JSON(APIResponse{
-		Status:   "success",
-		Provider: "moviebox",
-		Action:   "search",
-		Data:     result,
-	})
+	return success(c, "search", result)
 }
 
+// Details: GET /api/v1/anime/:id
 func (a *API) details(c *fiber.Ctx) error {
 	id := strings.TrimSpace(c.Params("id"))
-
-	if id == "" {
-		return apiError(c, fiber.StatusBadRequest, "Anime ID is required")
+	if err := validateID(id); err != nil {
+		return apiError(c, fiber.StatusBadRequest, err.Error())
 	}
 
 	ctx, cancel := a.requestContext(c)
@@ -181,22 +168,17 @@ func (a *API) details(c *fiber.Ctx) error {
 		return handleProviderError(c, err)
 	}
 
-	return c.JSON(APIResponse{
-		Status:   "success",
-		Provider: "moviebox",
-		Action:   "details",
-		Data:     result,
-	})
+	return success(c, "details", result)
 }
 
+// Episodes: GET /api/v1/anime/:id/episodes?season=1
 func (a *API) episodes(c *fiber.Ctx) error {
 	id := strings.TrimSpace(c.Params("id"))
-	season := c.QueryInt("season", 1)
-
-	if id == "" {
-		return apiError(c, fiber.StatusBadRequest, "Anime ID is required")
+	if err := validateID(id); err != nil {
+		return apiError(c, fiber.StatusBadRequest, err.Error())
 	}
 
+	season := c.QueryInt("season", 1)
 	if season < 0 || season > 1000 {
 		return apiError(c, fiber.StatusBadRequest, "Invalid season")
 	}
@@ -209,27 +191,22 @@ func (a *API) episodes(c *fiber.Ctx) error {
 		return handleProviderError(c, err)
 	}
 
-	return c.JSON(APIResponse{
-		Status:   "success",
-		Provider: "moviebox",
-		Action:   "episodes",
-		Data:     result,
-	})
+	return success(c, "episodes", result)
 }
 
+// Sources: GET /api/v1/anime/:id/sources?season=1&episode=1
 func (a *API) sources(c *fiber.Ctx) error {
 	id := strings.TrimSpace(c.Params("id"))
+	if err := validateID(id); err != nil {
+		return apiError(c, fiber.StatusBadRequest, err.Error())
+	}
+
 	season := c.QueryInt("season", 1)
 	episode := c.QueryInt("episode", 1)
-
-	if id == "" {
-		return apiError(c, fiber.StatusBadRequest, "Anime ID is required")
-	}
 
 	if season < 0 || season > 1000 {
 		return apiError(c, fiber.StatusBadRequest, "Invalid season")
 	}
-
 	if episode < 1 || episode > 100000 {
 		return apiError(c, fiber.StatusBadRequest, "Invalid episode")
 	}
@@ -242,24 +219,19 @@ func (a *API) sources(c *fiber.Ctx) error {
 		return handleProviderError(c, err)
 	}
 
-	return c.JSON(APIResponse{
-		Status:   "success",
-		Provider: "moviebox",
-		Action:   "sources",
-		Data:     result,
-	})
+	return success(c, "sources", result)
 }
 
+// Subtitles: GET /api/v1/anime/:id/subtitles?resource_id=...
 func (a *API) subtitles(c *fiber.Ctx) error {
 	id := strings.TrimSpace(c.Params("id"))
 	resourceID := strings.TrimSpace(c.Query("resource_id"))
 
-	if id == "" || resourceID == "" {
-		return apiError(
-			c,
-			fiber.StatusBadRequest,
-			"Anime ID and resource_id are required",
-		)
+	if err := validateID(id); err != nil {
+		return apiError(c, fiber.StatusBadRequest, err.Error())
+	}
+	if err := validateID(resourceID); err != nil {
+		return apiError(c, fiber.StatusBadRequest, "Valid resource_id is required")
 	}
 
 	ctx, cancel := a.requestContext(c)
@@ -270,16 +242,21 @@ func (a *API) subtitles(c *fiber.Ctx) error {
 		return handleProviderError(c, err)
 	}
 
+	return success(c, "subtitles", result)
+}
+
+// Use Fiber's user context so request-scoped context values are preserved.
+func (a *API) requestContext(c *fiber.Ctx) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(c.UserContext(), a.timeout)
+}
+
+func success(c *fiber.Ctx, action string, data any) error {
 	return c.JSON(APIResponse{
 		Status:   "success",
 		Provider: "moviebox",
-		Action:   "subtitles",
-		Data:     result,
+		Action:   action,
+		Data:     data,
 	})
-}
-
-func (a *API) requestContext(c *fiber.Ctx) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), a.timeout)
 }
 
 func apiError(c *fiber.Ctx, status int, message string) error {
@@ -292,33 +269,74 @@ func apiError(c *fiber.Ctx, status int, message string) error {
 
 func handleProviderError(c *fiber.Ctx, err error) error {
 	if err == nil {
-		return apiError(c, fiber.StatusInternalServerError, "Unknown provider error")
+		return apiError(
+			c,
+			fiber.StatusInternalServerError,
+			"Unknown provider error",
+		)
 	}
 
 	if errors.Is(err, context.DeadlineExceeded) {
-		return apiError(c, fiber.StatusGatewayTimeout, "MovieBox request timed out")
+		log.Printf("MovieBox timeout: %v", err)
+		return apiError(
+			c,
+			fiber.StatusGatewayTimeout,
+			"MovieBox request timed out",
+		)
 	}
 
 	if errors.Is(err, context.Canceled) {
-		return apiError(c, fiber.StatusRequestTimeout, "Request cancelled")
+		return apiError(
+			c,
+			fiber.StatusRequestTimeout,
+			"Request cancelled",
+		)
 	}
 
-	message := err.Error()
+	// moviebox.go defines movieBoxHTTPError.
+	var upstreamErr *movieBoxHTTPError
+	if errors.As(err, &upstreamErr) {
+		log.Printf(
+			"MovieBox upstream HTTP error: status=%d message=%s",
+			upstreamErr.StatusCode,
+			upstreamErr.Message,
+		)
 
-	status := fiber.StatusBadGateway
-
-	if strings.Contains(message, "required") ||
-		strings.Contains(message, "invalid") {
-		status = fiber.StatusBadRequest
+		switch upstreamErr.StatusCode {
+		case 400:
+			return apiError(c, fiber.StatusBadGateway, "MovieBox rejected the request")
+		case 401, 403:
+			return apiError(
+				c,
+				fiber.StatusBadGateway,
+				"MovieBox upstream authorization failed",
+			)
+		case 404:
+			return apiError(c, fiber.StatusNotFound, "MovieBox resource not found")
+		case 429:
+			return apiError(
+				c,
+				fiber.StatusServiceUnavailable,
+				"MovieBox upstream rate limit reached",
+			)
+		default:
+			if upstreamErr.StatusCode >= 500 {
+				return apiError(
+					c,
+					fiber.StatusBadGateway,
+					"MovieBox upstream service unavailable",
+				)
+			}
+		}
 	}
 
 	log.Printf("MovieBox provider error: %v", err)
 
-	return c.Status(status).JSON(APIResponse{
-		Status:   "error",
-		Provider: "moviebox",
-		Error:    message,
-	})
+	return apiError(
+		c,
+		fiber.StatusBadGateway,
+		"MovieBox provider request failed",
+	)
 }
 
-var _ = fmt.Sprintf
+var _ MovieBoxService = (*MovieBoxClient)(nil)
