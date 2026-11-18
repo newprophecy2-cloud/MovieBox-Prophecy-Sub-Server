@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +24,7 @@ const (
 	defaultMovieBoxHost = "https://api6.aoneroom.com"
 	defaultTimeout      = 25 * time.Second
 	maxResponseSize     = 8 << 20
+	sessionSafetyWindow = 60 * time.Second
 )
 
 var movieBoxHosts = []string{
@@ -42,13 +44,19 @@ type MovieBoxClient struct {
 	sessionMu sync.Mutex
 	token     string
 	expiresAt time.Time
-}
 
-type movieBoxResponse map[string]any
+	sessionFile string
+}
 
 type movieBoxHTTPError struct {
 	StatusCode int
 	Message    string
+}
+
+type movieBoxSession struct {
+	Token     string    `json:"token"`
+	ExpiresAt time.Time `json:"expires_at,omitempty"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 func (e *movieBoxHTTPError) Error() string {
@@ -65,17 +73,19 @@ func (e *movieBoxHTTPError) Error() string {
 func NewMovieBoxClient() *MovieBoxClient {
 	timeout := defaultTimeout
 
-	if value := strings.TrimSpace(os.Getenv("REQUEST_TIMEOUT")); value != "" {
-		if seconds, err := strconv.Atoi(value); err == nil &&
-			seconds >= 1 && seconds <= 120 {
-			timeout = time.Duration(seconds) * time.Second
+	for _, key := range []string{
+		"MOVIEBOX_REQUEST_TIMEOUT",
+		"REQUEST_TIMEOUT",
+	} {
+		value := strings.TrimSpace(os.Getenv(key))
+		if value == "" {
+			continue
 		}
-	}
 
-	if value := strings.TrimSpace(os.Getenv("MOVIEBOX_REQUEST_TIMEOUT")); value != "" {
-		if seconds, err := strconv.Atoi(value); err == nil &&
-			seconds >= 1 && seconds <= 120 {
+		seconds, err := strconv.Atoi(value)
+		if err == nil && seconds >= 1 && seconds <= 120 {
 			timeout = time.Duration(seconds) * time.Second
+			break
 		}
 	}
 
@@ -83,95 +93,203 @@ func NewMovieBoxClient() *MovieBoxClient {
 		strings.TrimSpace(os.Getenv("MOVIEBOX_API_BASE_URL")),
 		"/",
 	)
-
 	if host == "" {
 		host = defaultMovieBoxHost
 	}
 
-	client := &http.Client{
-		Timeout: timeout,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 5 {
-				return errors.New("too many redirects")
-			}
-			if len(via) > 0 &&
-				!strings.EqualFold(req.URL.Host, via[0].URL.Host) {
-				return errors.New("cross-host redirect rejected")
-			}
-			return nil
+	client := &MovieBoxClient{
+		httpClient: &http.Client{
+			Timeout: timeout,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if len(via) >= 5 {
+					return errors.New("too many redirects")
+				}
+
+				if len(via) > 0 &&
+					!strings.EqualFold(req.URL.Host, via[0].URL.Host) {
+					return errors.New("cross-host redirect rejected")
+				}
+
+				return nil
+			},
 		},
+		baseURL:     host,
+		sessionFile: strings.TrimSpace(os.Getenv("MOVIEBOX_SESSION_FILE")),
 	}
 
-	return &MovieBoxClient{
-		httpClient: client,
-		baseURL:    host,
-		token:      strings.TrimSpace(os.Getenv("MOVIEBOX_API_TOKEN")),
+	// An operator-provided token takes precedence.
+	client.token = strings.TrimSpace(os.Getenv("MOVIEBOX_API_TOKEN"))
+	if client.token != "" {
+		client.expiresAt = tokenExpiry(client.token)
 	}
+
+	// Load a persisted visitor session only if no operator token exists.
+	if client.token == "" {
+		client.loadSession()
+	}
+
+	return client
 }
 
 // --------------------------------------------------
-// SESSION
+// SESSION MANAGEMENT
 // --------------------------------------------------
 
-func (m *MovieBoxClient) ensureSession(ctx context.Context) (string, error) {
+func (m *MovieBoxClient) ensureSession(
+	ctx context.Context,
+) (string, error) {
 	m.sessionMu.Lock()
 	defer m.sessionMu.Unlock()
 
-	if m.token != "" && !m.sessionExpired() {
+	if m.token != "" && !m.sessionExpiredLocked() {
 		return m.token, nil
 	}
 
-	// A supplied operator token takes precedence over visitor login.
+	// Do not silently replace an explicitly configured token.
 	operatorToken := strings.TrimSpace(os.Getenv("MOVIEBOX_API_TOKEN"))
 	if operatorToken != "" {
 		m.token = operatorToken
-		m.expiresAt = time.Time{}
-		return m.token, nil
+		m.expiresAt = tokenExpiry(operatorToken)
+
+		if m.expiresAt.IsZero() ||
+			time.Now().Add(sessionSafetyWindow).Before(m.expiresAt) {
+			return m.token, nil
+		}
 	}
 
-	// Visitor login uses the public endpoint without private
-	// client-signing or fabricated device identity.
+	// Obtain a visitor session through the documented endpoint.
 	var response map[string]any
 
-	if err := m.requestRaw(
+	err := m.requestRaw(
 		ctx,
 		http.MethodPost,
 		"/wefeed-mobile-bff/user-api/visitor-login",
 		map[string]any{},
 		"",
 		&response,
-	); err != nil {
+	)
+	if err != nil {
 		return "", fmt.Errorf("MovieBox visitor login failed: %w", err)
 	}
 
 	data := unwrapData(response)
-	token := readString(data, "token", "accessToken")
+	token := readString(
+		data,
+		"token",
+		"accessToken",
+		"access_token",
+	)
 
 	if token == "" {
-		return "", errors.New("MovieBox visitor login returned no token")
+		return "", errors.New(
+			"MovieBox visitor login returned no access token",
+		)
 	}
 
 	m.token = token
 	m.expiresAt = tokenExpiry(token)
 
-	if m.expiresAt.IsZero() {
-		// Fallback when the token has no readable exp claim.
-		m.expiresAt = time.Now().Add(6 * 24 * time.Hour)
+	if err := m.saveSessionLocked(); err != nil {
+		// The session can still be used in memory.
+		// Persistence failure must not hide a successful login.
+		fmt.Printf("MovieBox session persistence warning: %v\n", err)
 	}
 
 	return m.token, nil
 }
 
-func (m *MovieBoxClient) sessionExpired() bool {
-	return !m.expiresAt.IsZero() &&
-		time.Now().Add(60*time.Second).After(m.expiresAt)
+func (m *MovieBoxClient) sessionExpiredLocked() bool {
+	if m.expiresAt.IsZero() {
+		return false
+	}
+
+	return !time.Now().Add(sessionSafetyWindow).Before(m.expiresAt)
 }
 
-func (m *MovieBoxClient) clearSession() {
+func (m *MovieBoxClient) clearSessionIfMatches(token string) {
 	m.sessionMu.Lock()
+	defer m.sessionMu.Unlock()
+
+	if m.token != token {
+		return
+	}
+
 	m.token = ""
 	m.expiresAt = time.Time{}
-	m.sessionMu.Unlock()
+
+	if m.sessionFile != "" {
+		if err := os.Remove(m.sessionFile); err != nil &&
+			!errors.Is(err, os.ErrNotExist) {
+			fmt.Printf("MovieBox session cleanup warning: %v\n", err)
+		}
+	}
+}
+
+func (m *MovieBoxClient) loadSession() {
+	if m.sessionFile == "" {
+		return
+	}
+
+	data, err := os.ReadFile(m.sessionFile)
+	if err != nil {
+		return
+	}
+
+	var session movieBoxSession
+	if err := json.Unmarshal(data, &session); err != nil {
+		return
+	}
+
+	if strings.TrimSpace(session.Token) == "" {
+		return
+	}
+
+	if !session.ExpiresAt.IsZero() &&
+		time.Now().Add(sessionSafetyWindow).After(session.ExpiresAt) {
+		return
+	}
+
+	m.token = session.Token
+	m.expiresAt = session.ExpiresAt
+}
+
+func (m *MovieBoxClient) saveSessionLocked() error {
+	if m.sessionFile == "" {
+		return nil
+	}
+
+	if strings.TrimSpace(m.token) == "" {
+		return errors.New("cannot persist an empty session")
+	}
+
+	session := movieBoxSession{
+		Token:     m.token,
+		ExpiresAt: m.expiresAt,
+		UpdatedAt: time.Now().UTC(),
+	}
+
+	data, err := json.Marshal(session)
+	if err != nil {
+		return err
+	}
+
+	dir := filepath.Dir(m.sessionFile)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+
+	tmp := m.sessionFile + ".tmp"
+
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return err
+	}
+
+	if err := os.Rename(tmp, m.sessionFile); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+
+	return nil
 }
 
 func tokenExpiry(token string) time.Time {
@@ -212,6 +330,7 @@ func (m *MovieBoxClient) Search(
 	if query == "" || len(query) > 200 {
 		return nil, errors.New("invalid search query")
 	}
+
 	if page < 1 || page > 10000 {
 		return nil, errors.New("invalid page")
 	}
@@ -276,11 +395,11 @@ func (m *MovieBoxClient) Details(
 
 		var seasons map[string]any
 
-		if err := m.getJSON(ctx, seasonPath, &seasons); err == nil {
-			subject["seasons"] = unwrapData(seasons)
-		} else {
-			subject["season_info_error"] = err.Error()
+		if err := m.getJSON(ctx, seasonPath, &seasons); err != nil {
+			return nil, fmt.Errorf("MovieBox season information: %w", err)
 		}
+
+		subject["seasons"] = unwrapData(seasons)
 	}
 
 	return result, nil
@@ -298,6 +417,7 @@ func (m *MovieBoxClient) Episodes(
 	if err := validateID(subjectID); err != nil {
 		return nil, err
 	}
+
 	if season < 0 || season > 1000 {
 		return nil, errors.New("invalid season")
 	}
@@ -321,6 +441,7 @@ func (m *MovieBoxClient) Episodes(
 	if len(seasons) == 0 {
 		seasons = extractSeasons(payload)
 	}
+
 	if len(seasons) == 0 {
 		return nil, errors.New("MovieBox season information unavailable")
 	}
@@ -338,11 +459,17 @@ func (m *MovieBoxClient) Episodes(
 	if selected == nil && season == 0 {
 		selected = seasons[0]
 	}
+
 	if selected == nil {
 		return nil, fmt.Errorf("season %d not found", season)
 	}
 
-	seasonNumber := readInt(selected, "se", "season", "seasonNumber")
+	seasonNumber := readInt(
+		selected,
+		"se",
+		"season",
+		"seasonNumber",
+	)
 	if seasonNumber == 0 {
 		seasonNumber = season
 	}
@@ -381,20 +508,20 @@ func (m *MovieBoxClient) Sources(
 	if err := validateID(subjectID); err != nil {
 		return nil, err
 	}
+
 	if season < 0 || season > 1000 ||
 		episode < 1 || episode > 100000 {
 		return nil, errors.New("invalid season or episode")
 	}
 
-	query := url.Values{}
-	query.Set("subjectId", subjectID)
-	query.Set("se", strconv.Itoa(season))
-	query.Set("ep", strconv.Itoa(episode))
+	playQuery := url.Values{}
+	playQuery.Set("subjectId", subjectID)
+	playQuery.Set("se", strconv.Itoa(season))
+	playQuery.Set("ep", strconv.Itoa(episode))
 
 	playPath := "/wefeed-mobile-bff/subject-api/play-info/v2?" +
-		query.Encode()
+		playQuery.Encode()
 
-	// Exact episode resource query.
 	resourceQuery := url.Values{}
 	resourceQuery.Set("subjectId", subjectID)
 	resourceQuery.Set("page", "1")
@@ -497,6 +624,7 @@ func (m *MovieBoxClient) Subtitles(
 	if err := validateID(subjectID); err != nil {
 		return nil, err
 	}
+
 	if err := validateID(resourceID); err != nil {
 		return nil, err
 	}
@@ -523,7 +651,7 @@ func (m *MovieBoxClient) Subtitles(
 }
 
 // --------------------------------------------------
-// HTTP LAYER
+// HTTP REQUEST LAYER
 // --------------------------------------------------
 
 func (m *MovieBoxClient) getJSON(
@@ -558,18 +686,23 @@ func (m *MovieBoxClient) requestJSON(
 	err = m.requestRaw(ctx, method, path, body, token, out)
 
 	var upstream *movieBoxHTTPError
-	if errors.As(err, &upstream) && upstream.StatusCode == http.StatusUnauthorized {
-		m.clearSession()
-
-		token, sessionErr := m.ensureSession(ctx)
-		if sessionErr != nil {
-			return sessionErr
-		}
-
-		return m.requestRaw(ctx, method, path, body, token, out)
+	if !errors.As(err, &upstream) ||
+		upstream.StatusCode != http.StatusUnauthorized {
+		return err
 	}
 
-	return err
+	// Refresh once after HTTP 401.
+	m.clearSessionIfMatches(token)
+
+	newToken, sessionErr := m.ensureSession(ctx)
+	if sessionErr != nil {
+		return fmt.Errorf(
+			"session refresh after HTTP 401 failed: %w",
+			sessionErr,
+		)
+	}
+
+	return m.requestRaw(ctx, method, path, body, newToken, out)
 }
 
 func (m *MovieBoxClient) requestRaw(
@@ -583,10 +716,13 @@ func (m *MovieBoxClient) requestRaw(
 	if ctx == nil {
 		return errors.New("request context is required")
 	}
+
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if !strings.HasPrefix(path, "/") || strings.HasPrefix(path, "//") {
+
+	if !strings.HasPrefix(path, "/") ||
+		strings.HasPrefix(path, "//") {
 		return errors.New("invalid API path")
 	}
 
@@ -596,6 +732,7 @@ func (m *MovieBoxClient) requestRaw(
 	}
 
 	var encoded []byte
+
 	if body != nil {
 		encoded, err = json.Marshal(body)
 		if err != nil {
@@ -642,6 +779,7 @@ func (m *MovieBoxClient) requestRaw(
 			if errors.As(err, &netErr) && netErr.Timeout() {
 				continue
 			}
+
 			continue
 		}
 
@@ -654,6 +792,7 @@ func (m *MovieBoxClient) requestRaw(
 			lastErr = readErr
 			continue
 		}
+
 		if len(data) > maxResponseSize {
 			return errors.New("MovieBox response exceeds size limit")
 		}
@@ -664,12 +803,15 @@ func (m *MovieBoxClient) requestRaw(
 				Message:    extractErrorMessage(data),
 			}
 
-			// Authorization errors are not bypassed or disguised.
-			if resp.StatusCode == 401 || resp.StatusCode == 403 {
+			// Do not rotate hosts or bypass authentication failures.
+			if resp.StatusCode == http.StatusUnauthorized ||
+				resp.StatusCode == http.StatusForbidden {
 				return httpErr
 			}
 
-			if resp.StatusCode == 429 || resp.StatusCode >= 500 {
+			// Retry transient upstream failures on another configured host.
+			if resp.StatusCode == http.StatusTooManyRequests ||
+				resp.StatusCode >= 500 {
 				lastErr = httpErr
 				continue
 			}
@@ -681,7 +823,10 @@ func (m *MovieBoxClient) requestRaw(
 			return nil
 		}
 
-		if err := json.Unmarshal(data, out); err != nil {
+		decoder := json.NewDecoder(bytes.NewReader(data))
+		decoder.UseNumber()
+
+		if err := decoder.Decode(out); err != nil {
 			return fmt.Errorf("decode MovieBox response: %w", err)
 		}
 
@@ -721,16 +866,18 @@ func (m *MovieBoxClient) hosts() ([]string, error) {
 }
 
 // --------------------------------------------------
-// RESPONSE UNWRAPPING
+// RESPONSE HELPERS
 // --------------------------------------------------
 
 func unwrapData(data map[string]any) map[string]any {
 	if data == nil {
 		return nil
 	}
+
 	if nested, ok := data["data"].(map[string]any); ok {
 		return nested
 	}
+
 	return data
 }
 
@@ -801,6 +948,11 @@ func extractEpisodeNumbers(season map[string]any) []int {
 	case []any:
 		for _, item := range items {
 			switch current := item.(type) {
+			case json.Number:
+				number, _ := current.Int64()
+				if number > 0 {
+					result = append(result, int(number))
+				}
 			case float64:
 				if current > 0 {
 					result = append(result, int(current))
@@ -814,7 +966,13 @@ func extractEpisodeNumbers(season map[string]any) []int {
 					result = append(result, number)
 				}
 			case map[string]any:
-				number := readInt(current, "ep", "episode", "number", "episodeNumber")
+				number := readInt(
+					current,
+					"ep",
+					"episode",
+					"number",
+					"episodeNumber",
+				)
 				if number > 0 {
 					result = append(result, number)
 				}
@@ -823,7 +981,13 @@ func extractEpisodeNumbers(season map[string]any) []int {
 	}
 
 	if len(result) == 0 {
-		max := readInt(season, "maxEp", "episodeCount", "totalEpisodes")
+		max := readInt(
+			season,
+			"maxEp",
+			"episodeCount",
+			"totalEpisodes",
+		)
+
 		if max > 0 && max <= 10000 {
 			for i := 1; i <= max; i++ {
 				result = append(result, i)
@@ -871,8 +1035,13 @@ func collectMaps(data map[string]any) []map[string]any {
 
 			for key, child := range current {
 				switch key {
-				case "streams", "list", "data", "resources",
-					"resourceList", "playList", "sources":
+				case "streams",
+					"list",
+					"data",
+					"resources",
+					"resourceList",
+					"playList",
+					"sources":
 					walk(child, depth+1)
 				}
 			}
@@ -903,6 +1072,7 @@ func normalizeSource(
 	if itemSeason != 0 && itemSeason != season {
 		return nil
 	}
+
 	if itemEpisode != 0 && itemEpisode != episode {
 		return nil
 	}
@@ -959,6 +1129,7 @@ func validMediaURL(raw string) bool {
 	}
 
 	lower := strings.ToLower(raw)
+
 	for _, word := range []string{
 		"notice",
 		"deprecation",
@@ -1062,15 +1233,18 @@ func readString(data map[string]any, keys ...string) string {
 	}
 
 	for _, key := range keys {
-		if value, ok := data[key].(string); ok {
+		switch value := data[key].(type) {
+		case string:
 			value = strings.TrimSpace(value)
 			if value != "" {
 				return value
 			}
-		}
-
-		if value, ok := data[key].(json.Number); ok {
+		case json.Number:
 			return value.String()
+		case float64:
+			return strconv.FormatFloat(value, 'f', -1, 64)
+		case int:
+			return strconv.Itoa(value)
 		}
 	}
 
@@ -1125,12 +1299,19 @@ func extractErrorMessage(data []byte) string {
 		return ""
 	}
 
-	for _, key := range []string{"message", "msg", "error", "detail"} {
+	for _, key := range []string{
+		"message",
+		"msg",
+		"error",
+		"detail",
+	} {
 		if value, ok := payload[key].(string); ok {
 			value = strings.TrimSpace(value)
+
 			if len(value) > 300 {
 				value = value[:300]
 			}
+
 			return value
 		}
 	}
