@@ -314,16 +314,20 @@ func apiError(c *fiber.Ctx, status int, message string) error {
 	})
 }
 
+// httpStatus = our API response status
+// upstreamStatus = actual MovieBox response status
+
 func upstreamAPIError(
 	c *fiber.Ctx,
-	status int,
+	httpStatus int,
+	upstreamStatus int,
 	message string,
 ) error {
-	return c.Status(status).JSON(APIResponse{
+	return c.Status(httpStatus).JSON(APIResponse{
 		Status:   "error",
 		Provider: apiProvider,
 		Error:    message,
-		Upstream: status,
+		Upstream: upstreamStatus,
 	})
 }
 
@@ -358,12 +362,18 @@ func handleProviderError(c *fiber.Ctx, err error) error {
 		switch status {
 		case 400:
 			return upstreamAPIError(
-				c, 502, "MovieBox rejected the request",
+				c,
+				502,
+				status,
+				"MovieBox rejected the request",
 			)
 
 		case 401:
 			return upstreamAPIError(
-				c, 502, "MovieBox authentication required",
+				c,
+				502,
+				status,
+				"MovieBox authentication required",
 			)
 
 		case 403:
@@ -374,33 +384,49 @@ func handleProviderError(c *fiber.Ctx, err error) error {
 				return upstreamAPIError(
 					c,
 					502,
+					status,
 					"MovieBox service is unavailable in the server's region",
 				)
 			}
 
 			return upstreamAPIError(
-				c, 502, "MovieBox denied the request",
+				c,
+				502,
+				status,
+				"MovieBox denied the request",
 			)
 
 		case 404:
 			return upstreamAPIError(
-				c, 404, "MovieBox resource not found",
+				c,
+				404,
+				status,
+				"MovieBox resource not found",
 			)
 
 		case 429:
 			return upstreamAPIError(
-				c, 503, "MovieBox upstream rate limit reached",
+				c,
+				503,
+				status,
+				"MovieBox upstream rate limit reached",
 			)
 
 		default:
 			if status >= 500 {
 				return upstreamAPIError(
-					c, 502, "MovieBox upstream service unavailable",
+					c,
+					502,
+					status,
+					"MovieBox upstream service unavailable",
 				)
 			}
 
 			return upstreamAPIError(
-				c, 502, "MovieBox upstream request failed",
+				c,
+				502,
+				status,
+				"MovieBox upstream request failed",
 			)
 		}
 	}
